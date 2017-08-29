@@ -5,6 +5,7 @@ import warnings
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.layers import core as core_layers
 
 import utils
 
@@ -201,8 +202,8 @@ class SeqGAN(object):
             use_multinomial: bool (default: True), whether or not to sample
                 from a multinomial distribution for each consecutive step of
                 the RNN.
-            num_rnns: int (default: 128), number of RNNs to stack.
-            rnn_dims: int (default: 3), number of outputs of the RNN.
+            num_rnns: int (default: 3), number of RNNs to stack.
+            rnn_dims: int (default: 128), number of outputs of the RNN.
         Returns:
             a tensor representing the generated question.
         """
@@ -210,8 +211,15 @@ class SeqGAN(object):
         with tf.variable_scope('generator'):
 
             # Creates the RNN output -> model output function.
+            '''
             output_W = self.get_weight('output_W', (rnn_dims, self.num_classes))
             output_fn = lambda x: tf.matmul(x, output_W)
+            '''
+            output_layer = core_layers.Dense(self.num_classes)
+
+            embeddings = tf.get_variable(
+                'dec_embedding',
+                [self.num_classes, rnn_dims])
 
             # Creates the RNN cell.
             cells = [tf.contrib.rnn.GRUCell(rnn_dims) for _ in range(num_rnns)]
@@ -234,6 +242,8 @@ class SeqGAN(object):
             # Creates the teacher forcing op.
             teacher_inp = tf.concat([tf.zeros_like(self.text_pl[:, :1]),
                                      self.text_pl[:, :-1]], axis=1)
+            teacher_inp = tf.nn.embedding_lookup(embeddings, teacher_inp)
+            '''
             teacher_inp = tf.one_hot(teacher_inp, self.num_classes)
             teacher_fn = tf.contrib.seq2seq.simple_decoder_fn_train(
                 encoder_state)
@@ -243,7 +253,12 @@ class SeqGAN(object):
                 inputs=teacher_inp,
                 decoder_fn=teacher_fn,
                 sequence_length=seq_len)
-            teacher_preds = tf.einsum('ijk,kl->ijl', teacher_preds, output_W)
+            '''
+            seq_len = tf.ones((batch_size,), 'int32') * self.text_len_pl
+            teacher_preds, _ = tf.nn.dynamic_rnn(cell, teacher_inp, sequence_length=seq_len, dtype='float32')
+
+            #teacher_preds = tf.einsum('ijk,kl->ijl', teacher_preds, output_W)
+            teacher_preds = output_layer.apply(teacher_preds)
             teach_loss = tf.contrib.seq2seq.sequence_loss(
                 logits=teacher_preds,
                 targets=self.text_pl,
@@ -275,6 +290,7 @@ class SeqGAN(object):
                     return done, state, next_input, output_var, ctx
 
             else:
+                '''
                 embeddings = tf.eye(self.num_classes)
                 infer_fn = tf.contrib.seq2seq.simple_decoder_fn_inference(
                     output_fn=output_fn,
@@ -285,13 +301,30 @@ class SeqGAN(object):
                     maximum_length=self.text_len_pl - 1,
                     num_decoder_symbols=self.num_classes,
                     name='decoder_inference_fn')
+                '''
 
+                helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(
+                    embedding=embeddings,
+                    start_tokens=tf.tile([0], [batch_size]),
+                    end_token=-1)
+                decoder = tf.contrib.seq2seq.BasicDecoder(
+                    cell=cell,
+                    helper=helper,
+                    initial_state=encoder_state,
+                    output_layer=output_layer)
+                (logits, sample_id), _, _  = tf.contrib.seq2seq.dynamic_decode(
+                    decoder=decoder,
+                    impute_finished=True,
+                    maximum_iterations=self.text_len_pl - 1)
+
+            '''
             generated_sequence, _, _ = tf.contrib.seq2seq.dynamic_rnn_decoder(
                 cell=cell,
                 decoder_fn=infer_fn)
+            '''
 
-            class_scores = tf.nn.softmax(generated_sequence)
-            generated_sequence = tf.argmax(generated_sequence, axis=-1)
+            class_scores = tf.nn.softmax(logits)
+            generated_sequence = tf.argmax(logits, axis=2)
             # generated_sequence = multinomial_3d(generated_sequence)
 
         tf.summary.scalar('loss/teacher', teach_loss)
@@ -309,7 +342,7 @@ class SeqGAN(object):
                 of the model.
             rnn_dims: int, number of dimensions in each RNN.
         Returns:
-            a tensor with shape (batch_size) that predicts whether the input
+            a tensor with shape (batch_size, num_timesteps, 1) that predicts whether the input
                 tensor is real or fake.
         """
 
@@ -318,8 +351,13 @@ class SeqGAN(object):
             if reuse:
                 tf.get_variable_scope().reuse_variables()
 
+            embeddings = tf.get_variable(
+                'dec_embedding',
+                [self.num_classes, rnn_dims])
+
             # Encodes the tensors as one-hot.
-            input_ohe = tf.one_hot(input_tensor, self.num_classes)
+            #input_ohe = tf.one_hot(input_tensor, self.num_classes)
+            input_ohe = tf.nn.embedding_lookup(embeddings, input_tensor)
 
             # Creates the RNN cell.
             cells = [tf.contrib.rnn.GRUCell(rnn_dims) for _ in range(num_rnns)]
@@ -332,8 +370,9 @@ class SeqGAN(object):
             rnn_output = tf.transpose(rnn_output, (1, 0, 2))
 
             # Reduces to binary prediction.
-            pred_W = self.get_weight('pred_W', (rnn_dims, 1))
+            pred_W = self.get_weight('pred_W', (rnn_dims, self.num_classes))
             preds = tf.einsum('ijk,kl->ijl', rnn_output, pred_W)
+
             preds = tf.sigmoid(preds)
 
         return preds
@@ -405,8 +444,9 @@ class SeqGAN(object):
             g_preds = tf.clip_by_value(g_preds * g_sequence, 1e-20, 1)
 
             # Keeps track of the "expected reward" at each timestep.
-            expected_reward = tf.Variable(tf.zeros((SEQUENCE_MAXLEN,)))
-            reward = d_preds - expected_reward[:tf.shape(d_preds)[1]]
+            expected_reward = tf.Variable(tf.zeros((SEQUENCE_MAXLEN, 44)))
+            reward = d_preds - expected_reward[:tf.shape(d_preds)[1],:]
+            #reward = d_preds - tf.expand_dims(expected_reward[:tf.shape(d_preds)[1]], -1)
             mean_reward = tf.reduce_mean(reward)
 
             # This variable is updated to know the "expected reward". This means
@@ -419,8 +459,10 @@ class SeqGAN(object):
             # The generator tries to maximize the outputs that lead to a high
             # reward value. Any timesteps before the reward happened should
             # recieve that reward (since it helped cause that reward).
-            reward = tf.expand_dims(tf.cumsum(reward, axis=1, reverse=True), -1)
-            gen_reward = tf.log(g_preds) * reward
+            reward = tf.cumsum(reward, axis=1, reverse=True)
+            #reward = tf.expand_dims(tf.cumsum(reward, axis=1, reverse=True), -1)
+            gen_reward = tf.log(g_preds) * reward # (100, 99, 44) * (100, 99, 99, 1) ジェネレータの報酬なので、discriminator が騙されたほうがよい
+            # g_preds は generator が出した各クラスの softmax
             gen_reward = tf.reduce_mean(gen_reward)
 
             # Maximize the reward signal.

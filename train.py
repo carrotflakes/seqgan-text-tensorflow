@@ -71,10 +71,10 @@ if __name__ == '__main__':
     model.build()
     model.load(ignore_missing=True)
 
-    for epoch in xrange(1, args.num_epochs + 1):
-        for step in xrange(1, args.num_steps + 1):
+    for epoch in range(1, args.num_epochs + 1):
+        for step in range(1, args.num_steps + 1):
             logging.info('epoch %d, step %d', epoch, step)
-            model.train_batch(iterator.next())
+            model.train_batch(next(iterator))
 
         # Generates a sample from the model.
         g = model.generate(1000)

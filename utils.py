@@ -3,7 +3,7 @@
 from __future__ import division
 
 import os
-import cPickle as pkl
+import _pickle as pkl
 import logging
 
 import numpy as np
